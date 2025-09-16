@@ -47,7 +47,7 @@ yandex-music-downloader --help
 https://yandex-music.readthedocs.io/en/main/token.html
 
 ## Примеры использования
-Во всех примерах замените `<Токен>` на ваш токен.
+Во всех примерах замените `<Токен>` на ваш токен. (y0__xDw2PGqARib9TUgtujKwRJE07TsPL6Mm2ekmKG_BzfKhLFEEA)
 
 ### Скачать все треки [Arctic Monkeys](https://music.yandex.ru/artist/208167) в наилучшем качестве
 ```
