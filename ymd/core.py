@@ -1,10 +1,11 @@
 import datetime as dt
-import random
+import hashlib
 import re
+import time
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import auto
+from enum import IntEnum, auto
 from pathlib import Path
 from typing import Optional, Union
 
@@ -13,6 +14,7 @@ from mutagen.flac import FLAC, Picture
 from mutagen.id3._frames import (
     APIC,
     TALB,
+    TCON,
     TDRC,
     TIT2,
     TPE1,
@@ -27,13 +29,20 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from strenum import LowercaseStrEnum
 from yandex_music import (
+    Album,
     Client,
-    DownloadInfo,
     Track,
     YandexMusicModel,
 )
+from yandex_music.exceptions import NetworkError
 
-from ymd.api import get_lossless_info
+from ymd import api
+from ymd.api import (
+    ApiTrackQuality,
+    Container,
+    CustomDownloadInfo,
+    get_download_info,
+)
 from ymd.mime_utils import MimeType, guess_mime_type
 
 UNSAFE_PATH_CLEAR_RE = re.compile(r"[/\\]+")
@@ -47,6 +56,15 @@ MAX_COMPATIBILITY_LEVEL = 1
 
 AUDIO_FILE_SUFFIXES = {".mp3", ".flac", ".m4a"}
 TEMPORARY_FILE_NAME_TEMPLATE = ".yandex-music-downloader.{}.tmp"
+MAX_FILE_NAME_LENGTH_WITHOUT_SUFFIX = 255 - max(
+    len(suffix) for suffix in AUDIO_FILE_SUFFIXES
+)
+
+
+class CoreTrackQuality(IntEnum):
+    LOW = 0
+    NORMAL = auto()
+    LOSSLESS = auto()
 
 
 class LyricsFormat(LowercaseStrEnum):
@@ -55,11 +73,16 @@ class LyricsFormat(LowercaseStrEnum):
     LRC = auto()
 
 
+CONTAINER_MUTAGEN_MAPPING: dict[Container, type[mutagen.FileType]] = {  # type: ignore
+    Container.MP3: MP3,
+    Container.FLAC: FLAC,
+    Container.MP4: MP4,
+}
+
+
 @dataclass
 class DownloadableTrack:
-    url: str
-    bitrate: int
-    codec: str
+    download_info: CustomDownloadInfo
     path: Path
     track: Track
 
@@ -70,16 +93,38 @@ class AlbumCover:
     mime_type: MimeType
 
 
-def init_client(token: str, timeout: int) -> Client:
+def init_client(
+    token: str, timeout: int, max_try_count: int, retry_delay: int
+) -> Client:
+    assert timeout > 0
+    assert max_try_count >= 0
+    assert retry_delay >= 0
+
     client = Client(token)
     client.request.set_timeout(timeout)
+
+    original_wrapper = client.request._request_wrapper
+
+    def retry_wrapper(*args, **kwargs):
+        try_count = 0
+        while True:
+            try:
+                return original_wrapper(*args, **kwargs)
+            except NetworkError as error:
+                if max_try_count == 0 or try_count < max_try_count:
+                    try_count += 1
+                    time.sleep(retry_delay)
+                    continue
+                raise error
+
+    client.request._request_wrapper = retry_wrapper
     return client.init()
 
 
-def full_title(obj: YandexMusicModel) -> Optional[str]:
+def full_title(obj: YandexMusicModel) -> str:
     result = obj["title"]
     if result is None:
-        return
+        return ""
     if version := obj["version"]:
         result += f" ({version})"
     return result
@@ -90,25 +135,26 @@ def prepare_base_path(
 ) -> Path:
     path_str = str(path_pattern)
     album = None
-    artist = None
+    album_artist = None
+    track_artist = None
     track_position = None
     if albums := track.albums:
         album = albums[0]
         track_position = album.track_position
         if artists := album.artists:
-            artist = artists[0]
-    if artist is None and (artists := track.artists):
-        artist = artists[0]
+            album_artist = artists[0]
+    if artists := track.artists:
+        track_artist = artists[0]
     repl_dict: dict[str, Union[str, int, None]] = {
         "#number-padded": str(track_position.index).zfill(len(str(album.track_count)))
         if track_position and album
         else None,
-        "#album-artist": artist.name if artist else None,
-        "#artist-id": artist.id if artist else None,
+        "#album-artist": album_artist.name if album_artist else None,
+        "#track-artist": track_artist.name if track_artist else None,
+        "#artist-id": track_artist.id if track_artist else None,
         "#album-id": album.id if album else None,
         "#track-id": track.id,
         "#number": track_position.index if track_position else None,
-        "#artist": artist.name if artist else None,
         "#title": full_title(track),
         "#album": full_title(album) if album else None,
         "#year": album.year if album else None,
@@ -121,22 +167,37 @@ def prepare_base_path(
             clear_re = UNSAFE_PATH_CLEAR_RE
         replacement = clear_re.sub("_", replacement)
         path_str = path_str.replace(placeholder, replacement)
-    return Path(path_str)
+    path = Path(path_str)
+    trimmed_parts = [
+        part
+        if len(part) <= MAX_FILE_NAME_LENGTH_WITHOUT_SUFFIX
+        else part[:MAX_FILE_NAME_LENGTH_WITHOUT_SUFFIX]
+        for part in path.parts
+    ]
+    return Path(*trimmed_parts)
 
 
 def set_tags(
     path: Path,
     track: Track,
+    container: Container,
     lyrics: Optional[str],
     album_cover: Optional[AlbumCover],
     compatibility_level: int,
 ) -> None:
-    album = track.albums[0]
-    track_artists = [a.name for a in track.artists if a.name]
-    album_artists = [a.name for a in album.artists if a.name]
-    tag = mutagen.File(path, [MP3, MP4, FLAC])  # type: ignore
+    file_type = CONTAINER_MUTAGEN_MAPPING.get(container)
+    if file_type is None:
+        raise ValueError(f"Unknown container: {container}")
+
+    tag = file_type(path)
+    album = track.albums[0] if track.albums else Album()
     album_title = full_title(album)
     track_title = full_title(track)
+    track_artists = [a.name for a in track.artists if a.name]
+    album_artists = [a.name for a in album.artists if a.name]
+    genre = None
+    if album.genre:
+        genre = album.genre
     track_number = None
     disc_number = None
     if position := album.track_position:
@@ -166,6 +227,8 @@ def set_tags(
             tag["TRCK"] = TRCK(encoding=3, text=str(track_number))
         if disc_number:
             tag["TPOS"] = TPOS(encoding=3, text=str(disc_number))
+        if genre:
+            tag["TCON"] = TCON(encoding=3, text=genre)
 
         if lyrics:
             tag["USLT"] = USLT(encoding=3, text=lyrics)
@@ -193,13 +256,15 @@ def set_tags(
         tag["aART"] = album_artists_value
 
         if iso8601_release_date is not None:
-            tag["rldt"] = iso8601_release_date
-        if release_year is not None:
+            tag["\xa9day"] = iso8601_release_date
+        elif release_year is not None:
             tag["\xa9day"] = release_year
         if track_number:
             tag["trkn"] = [(track_number, 0)]
         if disc_number:
             tag["disk"] = [(disc_number, 0)]
+        if genre:
+            tag["\xa9gen"] = genre
 
         if lyrics:
             tag["\xa9lyr"] = lyrics
@@ -225,6 +290,8 @@ def set_tags(
             tag["tracknumber"] = str(track_number)
         if disc_number:
             tag["discnumber"] = str(disc_number)
+        if genre:
+            tag["genre"] = genre
 
         if lyrics:
             tag["lyrics"] = lyrics
@@ -256,7 +323,6 @@ def download_track(
     track = track_info.track
     client = typing.cast(Client, track.client)
     assert client
-    album = track.albums[0]
 
     text_lyrics = None
     if lyrics_format != LyricsFormat.NONE and (lyrics_info := track.lyrics_info):
@@ -265,7 +331,8 @@ def download_track(
             if not lrc_path.is_file() and (
                 track_lyrics := track.get_lyrics(format_="LRC")
             ):
-                download_via_temporary_file(client, track_lyrics.download_url, lrc_path)
+                lyrics = track_lyrics.fetch_lyrics()
+                write_via_temporary_file(lyrics.encode("utf-8"), lrc_path)
         elif lyrics_info.has_available_text_lyrics:
             if track_lyrics := track.get_lyrics(format_="TEXT"):
                 text_lyrics = track_lyrics.fetch_lyrics()
@@ -282,12 +349,12 @@ def download_track(
             raise RuntimeError("Unknown cover mime type")
         album_cover = AlbumCover(data=cover_bytes, mime_type=mime_type)
         if embed_cover:
-            album_id = album.id
-            if album_id and (cached_cover := covers_cache.get(album_id)):
+            album = track.albums[0] if track.albums else Album()
+            if album.id and (cached_cover := covers_cache.get(album.id)):
                 cover = cached_cover
             else:
-                if album_id:
-                    cover = covers_cache[album_id] = album_cover
+                if album.id:
+                    cover = covers_cache[album.id] = album_cover
         else:
             mime_suffix_dict = {MimeType.JPEG: ".jpg", MimeType.PNG: ".png"}
             file_suffix = mime_suffix_dict.get(album_cover.mime_type)
@@ -297,76 +364,52 @@ def download_track(
             if not cover_path.is_file():
                 write_via_temporary_file(album_cover.data, cover_path)
 
-    download_via_temporary_file(
-        client,
-        track_info.url,
+    download_info = track_info.download_info
+    track_data = api.download_track(client, download_info)
+
+    write_via_temporary_file(
+        track_data,
         target_path,
-        post_download_hook=lambda tmp_path: set_tags(
-            tmp_path, track, text_lyrics, cover, compatibility_level
+        temporary_file_hook=lambda tmp_path: set_tags(
+            tmp_path,
+            track,
+            download_info.file_format.container,
+            text_lyrics,
+            cover,
+            compatibility_level,
         ),
     )
 
 
 def to_downloadable_track(
-    track: Track, quality: int, base_path: Path
+    track: Track, quality: CoreTrackQuality, base_path: Path
 ) -> DownloadableTrack:
-    url: str
-    codec: str
-    bitrate: int
-    codec: str
-    if quality == 2:
-        download_info = get_lossless_info(track)
-        codec = download_info.codec
-        url = random.choice(download_info.urls)
-        bitrate = download_info.bitrate
-    else:
-        download_info = track.get_download_info(get_direct_links=True)
-        download_info = [e for e in download_info if e.codec in ("mp3", "aac")]
+    api_quality = ApiTrackQuality.NORMAL
+    if quality == CoreTrackQuality.LOW:
+        api_quality = ApiTrackQuality.LOW
+    elif quality == CoreTrackQuality.NORMAL:
+        api_quality = ApiTrackQuality.NORMAL
+    elif quality == CoreTrackQuality.LOSSLESS:
+        api_quality = ApiTrackQuality.LOSSLESS
 
-        def sort_key(e: DownloadInfo) -> Union[int, float]:
-            aac_multiplier = 1.5
-            bitrate = e.bitrate_in_kbps
-            if bitrate <= 192:
-                aac_multiplier = 0.5
-            if e.codec == "aac":
-                bitrate *= aac_multiplier
-            return bitrate
+    download_info = get_download_info(track, api_quality)
+    container = download_info.file_format.container
 
-        download_info.sort(
-            key=sort_key,
-            reverse=quality == 0,
-        )
-        target_info = download_info[-1]
-        url = typing.cast(str, target_info.direct_link)
-        bitrate = target_info.bitrate_in_kbps
-        codec = target_info.codec
-
-    if codec == "mp3":
+    if container == Container.MP3:
         suffix = ".mp3"
-    elif codec == "aac" or codec == "he-aac":
+    elif container == Container.MP4:
         suffix = ".m4a"
-    elif codec == "flac":
+    elif container == Container.FLAC:
         suffix = ".flac"
     else:
         raise RuntimeError("Unknown codec")
+
     target_path = str(base_path) + suffix
     return DownloadableTrack(
-        url=url,
+        download_info=download_info,
         track=track,
-        bitrate=bitrate,
-        codec=codec,
         path=Path(target_path),
     )
-
-
-def download_via_temporary_file(
-    client: Client,
-    url: str,
-    target_path: Path,
-    post_download_hook: Optional[Callable[[Path], None]] = None,
-) -> Path:
-    data = client.request.retrieve(url)
-    return write_via_temporary_file(data, target_path, post_download_hook)
 
 
 def write_via_temporary_file(
@@ -374,8 +417,9 @@ def write_via_temporary_file(
     target_path: Path,
     temporary_file_hook: Optional[Callable[[Path], None]] = None,
 ) -> Path:
+    target_name = hashlib.sha256(target_path.name.encode()).hexdigest()
     temporary_file = target_path.parent / (
-        TEMPORARY_FILE_NAME_TEMPLATE.format(target_path.name)
+        TEMPORARY_FILE_NAME_TEMPLATE.format(target_name)
     )
     try:
         temporary_file.write_bytes(data)
