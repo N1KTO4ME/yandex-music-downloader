@@ -69,6 +69,11 @@ yandex-music-downloader --token "<Токен>" --quality 1 --lyrics-format lrc -
 yandex-music-downloader --token "<Токен>" --url "https://music.yandex.ru/album/11644078/track/6705392"
 ```
 
+### Мой шаблон для плейлиста
+```
+yandex-music-downloader --token "" --embed-cover --quality 2 --url ""
+```
+
 ## Использование
 ```
 usage: yandex-music-downloader [-h] [--quality <Качество>] [--skip-existing]
